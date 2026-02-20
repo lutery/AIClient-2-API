@@ -320,12 +320,149 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     requestBody.model = model;
     const nativeStream = await service.generateContentStream(model, requestBody);
     const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
+    const clientProtocol = getProtocolPrefix(fromProvider);
+    const backendProtocol = getProtocolPrefix(toProvider);
+    const claudeFallbackState = {
+        messageStarted: false,
+        startedBlocks: new Set()
+    };
+
+    const buildClaudeFallbackFromOpenAIChunk = (openaiChunk) => {
+        const choice = openaiChunk?.choices?.[0];
+        if (!choice) {
+            return null;
+        }
+
+        const delta = choice.delta || {};
+        const finishReason = choice.finish_reason;
+        const events = [];
+
+        const ensureMessageStart = () => {
+            if (claudeFallbackState.messageStarted) {
+                return;
+            }
+
+            events.push({
+                type: 'message_start',
+                message: {
+                    id: openaiChunk.id || `msg_${Date.now()}`,
+                    type: 'message',
+                    role: 'assistant',
+                    content: [],
+                    model: model || openaiChunk.model || 'unknown',
+                    stop_reason: null,
+                    stop_sequence: null,
+                    usage: {
+                        input_tokens: openaiChunk.usage?.prompt_tokens || 0,
+                        output_tokens: 0
+                    }
+                }
+            });
+            claudeFallbackState.messageStarted = true;
+        };
+
+        const ensureTextBlockStart = () => {
+            if (claudeFallbackState.startedBlocks.has(0)) {
+                return;
+            }
+            events.push({
+                type: 'content_block_start',
+                index: 0,
+                content_block: {
+                    type: 'text',
+                    text: ''
+                }
+            });
+            claudeFallbackState.startedBlocks.add(0);
+        };
+
+        const ensureThinkingBlockStart = () => {
+            if (claudeFallbackState.startedBlocks.has(1)) {
+                return;
+            }
+            events.push({
+                type: 'content_block_start',
+                index: 1,
+                content_block: {
+                    type: 'thinking',
+                    thinking: ''
+                }
+            });
+            claudeFallbackState.startedBlocks.add(1);
+        };
+
+        if (delta.role === 'assistant') {
+            ensureMessageStart();
+        }
+
+        if (delta.reasoning_content) {
+            ensureMessageStart();
+            ensureThinkingBlockStart();
+            events.push({
+                type: 'content_block_delta',
+                index: 1,
+                delta: {
+                    type: 'thinking_delta',
+                    thinking: delta.reasoning_content
+                }
+            });
+        }
+
+        if (delta.content) {
+            ensureMessageStart();
+            ensureTextBlockStart();
+            events.push({
+                type: 'content_block_delta',
+                index: 0,
+                delta: {
+                    type: 'text_delta',
+                    text: delta.content
+                }
+            });
+        }
+
+        if (finishReason) {
+            ensureMessageStart();
+            for (const index of claudeFallbackState.startedBlocks) {
+                events.push({
+                    type: 'content_block_stop',
+                    index
+                });
+            }
+
+            const stopReason = finishReason === 'stop' ? 'end_turn' :
+                finishReason === 'length' ? 'max_tokens' :
+                    finishReason === 'tool_calls' ? 'tool_use' : 'end_turn';
+
+            events.push({
+                type: 'message_delta',
+                delta: {
+                    stop_reason: stopReason,
+                    stop_sequence: null
+                },
+                usage: {
+                    input_tokens: openaiChunk.usage?.prompt_tokens || 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: openaiChunk.usage?.prompt_tokens_details?.cached_tokens || 0,
+                    output_tokens: openaiChunk.usage?.completion_tokens || 0
+                }
+            });
+            events.push({ type: 'message_stop' });
+
+            claudeFallbackState.messageStarted = false;
+            claudeFallbackState.startedBlocks.clear();
+        }
+
+        return events.length > 0 ? events : null;
+    };
 
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
+    let nativeChunkCount = 0;
 
     try {
         for await (const nativeChunk of nativeStream) {
+            nativeChunkCount++;
             // 检查客户端是否已断开连接
             if (clientDisconnected.value) {
                 logger.info('[Stream] Stopping iteration due to client disconnect');
@@ -339,9 +476,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             }
 
             // Convert the complete chunk object to the client's format (fromProvider), if necessary.
-            const chunkToSend = needsConversion
+            let chunkToSend = needsConversion
                 ? convertData(nativeChunk, 'streamChunk', toProvider, fromProvider, model)
                 : nativeChunk;
+
+            if (!chunkToSend && clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE && backendProtocol === MODEL_PROTOCOL_PREFIX.OPENAI) {
+                chunkToSend = buildClaudeFallbackFromOpenAIChunk(nativeChunk);
+            }
 
             // 监控钩子：流式响应分块
             if (CONFIG?._monitorRequestId) {
@@ -444,7 +585,147 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             }
         }
 
+        // Claude 客户端兜底：当上游流式返回空 chunk 时，回退到非流式并包装为 Claude SSE 事件
+        if (
+            clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE &&
+            nativeChunkCount === 0 &&
+            !hasMessageStop &&
+            !clientDisconnected.value &&
+            !res.writableEnded
+        ) {
+            try {
+                logger.warn('[Stream Fallback] No chunks from upstream stream. Falling back to unary response for Claude SSE.');
+                const unaryRequestBody = { ...requestBody, stream: false };
+                const nativeUnaryResponse = await service.generateContent(model, unaryRequestBody);
+                const claudeUnaryResponse = needsConversion
+                    ? convertData(nativeUnaryResponse, 'response', toProvider, fromProvider, model)
+                    : nativeUnaryResponse;
+
+                if (claudeUnaryResponse?.type === 'message') {
+                    res.write('event: message_start\n');
+                    res.write(`data: ${JSON.stringify({
+                        type: 'message_start',
+                        message: {
+                            id: claudeUnaryResponse.id,
+                            type: 'message',
+                            role: 'assistant',
+                            content: [],
+                            model: claudeUnaryResponse.model,
+                            stop_reason: null,
+                            stop_sequence: null,
+                            usage: {
+                                input_tokens: claudeUnaryResponse.usage?.input_tokens || 0,
+                                output_tokens: 0
+                            }
+                        }
+                    })}\n\n`);
+
+                    let blockIndex = 0;
+                    for (const block of claudeUnaryResponse.content || []) {
+                        if (block?.type === 'text') {
+                            res.write('event: content_block_start\n');
+                            res.write(`data: ${JSON.stringify({
+                                type: 'content_block_start',
+                                index: blockIndex,
+                                content_block: { type: 'text', text: '' }
+                            })}\n\n`);
+
+                            if (block.text) {
+                                res.write('event: content_block_delta\n');
+                                res.write(`data: ${JSON.stringify({
+                                    type: 'content_block_delta',
+                                    index: blockIndex,
+                                    delta: { type: 'text_delta', text: block.text }
+                                })}\n\n`);
+                            }
+
+                            res.write('event: content_block_stop\n');
+                            res.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: blockIndex })}\n\n`);
+                            blockIndex++;
+                        }
+
+                        if (block?.type === 'thinking') {
+                            res.write('event: content_block_start\n');
+                            res.write(`data: ${JSON.stringify({
+                                type: 'content_block_start',
+                                index: blockIndex,
+                                content_block: { type: 'thinking', thinking: '' }
+                            })}\n\n`);
+
+                            if (block.thinking) {
+                                res.write('event: content_block_delta\n');
+                                res.write(`data: ${JSON.stringify({
+                                    type: 'content_block_delta',
+                                    index: blockIndex,
+                                    delta: { type: 'thinking_delta', thinking: block.thinking }
+                                })}\n\n`);
+                            }
+
+                            res.write('event: content_block_stop\n');
+                            res.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: blockIndex })}\n\n`);
+                            blockIndex++;
+                        }
+                    }
+
+                    res.write('event: message_delta\n');
+                    res.write(`data: ${JSON.stringify({
+                        type: 'message_delta',
+                        delta: {
+                            stop_reason: claudeUnaryResponse.stop_reason || 'end_turn',
+                            stop_sequence: claudeUnaryResponse.stop_sequence || null
+                        },
+                        usage: claudeUnaryResponse.usage || {
+                            input_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                            output_tokens: 0
+                        }
+                    })}\n\n`);
+
+                    res.write('event: message_stop\n');
+                    res.write('data: {"type":"message_stop"}\n\n');
+                    hasMessageStop = true;
+                }
+            } catch (fallbackError) {
+                logger.error('[Stream Fallback] Unary fallback failed:', fallbackError.message);
+
+                if (!res.writableEnded) {
+                    res.write('event: message_start\n');
+                    res.write(`data: ${JSON.stringify({
+                        type: 'message_start',
+                        message: {
+                            id: `msg_${Date.now()}`,
+                            type: 'message',
+                            role: 'assistant',
+                            content: [],
+                            model,
+                            stop_reason: null,
+                            stop_sequence: null,
+                            usage: {
+                                input_tokens: 0,
+                                output_tokens: 0
+                            }
+                        }
+                    })}\n\n`);
+
+                    res.write('event: content_block_start\n');
+                    res.write('data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n');
+
+                    res.write('event: content_block_stop\n');
+                    res.write('data: {"type":"content_block_stop","index":0}\n\n');
+
+                    res.write('event: message_delta\n');
+                    res.write('data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}\n\n');
+
+                    res.write('event: message_stop\n');
+                    res.write('data: {"type":"message_stop"}\n\n');
+                    hasMessageStop = true;
+                }
+            }
+        }
+
         // 流式请求成功完成，统计使用次数，错误次数重置为0
+
         if (providerPoolManager && pooluuid) {
             const customNameDisplay = customName ? `, ${customName}` : '';
             logger.info(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful stream request`);
@@ -585,7 +866,6 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 如果是重试成功，递归调用会处理结束标记
         if (!responseClosed && !clientDisconnected.value && !isRetry) {
             // 根据客户端协议发送相应的流式结束标记
-            const clientProtocol = getProtocolPrefix(fromProvider);
             if (!res.writableEnded) {
                 try {
                     if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI) {
