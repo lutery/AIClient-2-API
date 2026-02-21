@@ -45,6 +45,7 @@ export class OpenAIConverter extends BaseConverter {
         super('openai');
         // 创建 CodexConverter 实例用于委托
         this.codexConverter = new CodexConverter();
+        this.claudeStreamState = new Map();
     }
 
     /**
@@ -404,148 +405,203 @@ export class OpenAIConverter extends BaseConverter {
     toClaudeStreamChunk(openaiChunk, model) {
         if (!openaiChunk) return null;
 
-        // 处理 OpenAI chunk 对象
         if (typeof openaiChunk === 'object' && !Array.isArray(openaiChunk)) {
             const choice = openaiChunk.choices?.[0];
             if (!choice) {
                 return null;
             }
 
-            const delta = choice.delta;
+            const streamId = openaiChunk.id || '__openai_claude_stream__';
+            if (!this.claudeStreamState.has(streamId)) {
+                this.claudeStreamState.set(streamId, {
+                    messageId: openaiChunk.id ? `msg_${openaiChunk.id}` : `msg_${uuidv4()}`,
+                    started: false,
+                    textBlockStarted: false,
+                    thinkingBlockStarted: false,
+                    toolBlocks: new Map(),
+                });
+            }
+            const state = this.claudeStreamState.get(streamId);
+
+            const delta = choice.delta || {};
             const finishReason = choice.finish_reason;
             const events = [];
 
-            // 注释部分是为了兼容claude code，但是不兼容cherry studio
-            // 1. 处理 role (对应 message_start) 
-            // if (delta?.role === "assistant") {
-            //     events.push({
-            //         type: "message_start",
-            //         message: {
-            //             id: openaiChunk.id || `msg_${uuidv4()}`,
-            //             type: "message",
-            //             role: "assistant",
-            //             content: [],
-            //             model: model || openaiChunk.model || "unknown",
-            //             stop_reason: null,
-            //             stop_sequence: null,
-            //             usage: {
-            //                 input_tokens: openaiChunk.usage?.prompt_tokens || 0,
-            //                 output_tokens: 0
-            //             }
-            //         }
-            //     });
-            //     events.push({
-            //         type: "content_block_start",
-            //         index: 0,
-            //         content_block: {
-            //             type: "text",
-            //             text: ""
-            //         }
-            //     });
-            // }
+            if (!state.started) {
+                events.push({
+                    type: 'message_start',
+                    message: {
+                        id: state.messageId,
+                        type: 'message',
+                        role: 'assistant',
+                        content: [],
+                        model: model || openaiChunk.model || 'unknown',
+                        stop_reason: null,
+                        stop_sequence: null,
+                        usage: {
+                            input_tokens: openaiChunk.usage?.prompt_tokens || 0,
+                            output_tokens: 0,
+                        },
+                    },
+                });
+                state.started = true;
+            }
 
-            // 2. 处理 tool_calls (对应 content_block_start 和 content_block_delta)
-            // if (delta?.tool_calls) {
-            //     const toolCalls = delta.tool_calls;
-            //     for (const toolCall of toolCalls) {
-            //         // 如果有 function.name，说明是工具调用开始
-            //         if (toolCall.function?.name) {
-            //             events.push({
-            //                 type: "content_block_start",
-            //                 index: toolCall.index || 0,
-            //                 content_block: {
-            //                     type: "tool_use",
-            //                     id: toolCall.id || `tool_${uuidv4()}`,
-            //                     name: toolCall.function.name,
-            //                     input: {}
-            //                 }
-            //             });
-            //         }
-
-            //         // 如果有 function.arguments，说明是参数增量
-            //         if (toolCall.function?.arguments) {
-            //             events.push({
-            //                 type: "content_block_delta",
-            //                 index: toolCall.index || 0,
-            //                 delta: {
-            //                     type: "input_json_delta",
-            //                     partial_json: toolCall.function.arguments
-            //                 }
-            //             });
-            //         }
-            //     }
-            // }
-
-            // 3. 处理 reasoning_content (对应 thinking 类型的 content_block)
             if (delta?.reasoning_content) {
-                // 注意：这里可能需要先发送 content_block_start，但由于状态管理复杂，
-                // 我们假设调用方会处理这个逻辑
+                if (!state.thinkingBlockStarted) {
+                    events.push({
+                        type: 'content_block_start',
+                        index: 1,
+                        content_block: {
+                            type: 'thinking',
+                            thinking: '',
+                        },
+                    });
+                    state.thinkingBlockStarted = true;
+                }
+
                 events.push({
-                    type: "content_block_delta",
-                    index: 0,
+                    type: 'content_block_delta',
+                    index: 1,
                     delta: {
-                        type: "thinking_delta",
-                        thinking: delta.reasoning_content
-                    }
+                        type: 'thinking_delta',
+                        thinking: delta.reasoning_content,
+                    },
                 });
             }
 
-            // 4. 处理普通文本 content (对应 text 类型的 content_block)
             if (delta?.content) {
+                if (!state.textBlockStarted) {
+                    events.push({
+                        type: 'content_block_start',
+                        index: 0,
+                        content_block: {
+                            type: 'text',
+                            text: '',
+                        },
+                    });
+                    state.textBlockStarted = true;
+                }
+
                 events.push({
-                    type: "content_block_delta",
+                    type: 'content_block_delta',
                     index: 0,
                     delta: {
-                        type: "text_delta",
-                        text: delta.content
-                    }
+                        type: 'text_delta',
+                        text: delta.content,
+                    },
                 });
             }
 
-            // 5. 处理 finish_reason (对应 message_delta 和 message_stop)
+            if (Array.isArray(delta.tool_calls)) {
+                for (const toolCall of delta.tool_calls) {
+                    const toolIndex = Number.isInteger(toolCall.index) ? toolCall.index : 0;
+
+                    if (!state.toolBlocks.has(toolIndex)) {
+                        state.toolBlocks.set(toolIndex, {
+                            id: toolCall.id || `tool_${uuidv4()}`,
+                            name: toolCall.function?.name || 'unknown_tool',
+                        });
+                    }
+                    const toolState = state.toolBlocks.get(toolIndex);
+
+                    if (toolCall.function?.name && toolState.name === 'unknown_tool') {
+                        toolState.name = toolCall.function.name;
+                    }
+                    if (toolCall.id && !toolState.id) {
+                        toolState.id = toolCall.id;
+                    }
+
+                    if (!toolState.started) {
+                        events.push({
+                            type: 'content_block_start',
+                            index: toolIndex,
+                            content_block: {
+                                type: 'tool_use',
+                                id: toolState.id,
+                                name: toolState.name,
+                                input: {},
+                            },
+                        });
+                        toolState.started = true;
+                    }
+
+                    if (toolCall.function?.arguments) {
+                        events.push({
+                            type: 'content_block_delta',
+                            index: toolIndex,
+                            delta: {
+                                type: 'input_json_delta',
+                                partial_json: toolCall.function.arguments,
+                            },
+                        });
+                    }
+                }
+            }
+
             if (finishReason) {
-                // 映射 finish_reason
-                const stopReason = finishReason === "stop" ? "end_turn" :
-                    finishReason === "length" ? "max_tokens" :
-                        "end_turn";
+                const stopReasonMap = {
+                    stop: 'end_turn',
+                    length: 'max_tokens',
+                    tool_calls: 'tool_use',
+                };
+                const stopReason = stopReasonMap[finishReason] || 'end_turn';
+
+                if (state.textBlockStarted) {
+                    events.push({
+                        type: 'content_block_stop',
+                        index: 0,
+                    });
+                }
+
+                if (state.thinkingBlockStarted) {
+                    events.push({
+                        type: 'content_block_stop',
+                        index: 1,
+                    });
+                }
+
+                for (const [toolIndex, toolState] of state.toolBlocks.entries()) {
+                    if (toolState.started) {
+                        events.push({
+                            type: 'content_block_stop',
+                            index: toolIndex,
+                        });
+                    }
+                }
 
                 events.push({
-                    type: "content_block_stop",
-                    index: 0
-                });
-                // 发送 message_delta
-                events.push({
-                    type: "message_delta",
+                    type: 'message_delta',
                     delta: {
                         stop_reason: stopReason,
-                        stop_sequence: null
+                        stop_sequence: null,
                     },
                     usage: {
                         input_tokens: openaiChunk.usage?.prompt_tokens || 0,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: openaiChunk.usage?.prompt_tokens_details?.cached_tokens || 0,
-                        output_tokens: openaiChunk.usage?.completion_tokens || 0
-                    }
+                        output_tokens: openaiChunk.usage?.completion_tokens || 0,
+                    },
                 });
 
-                // 发送 message_stop
                 events.push({
-                    type: "message_stop"
+                    type: 'message_stop',
                 });
+
+                this.claudeStreamState.delete(streamId);
             }
 
             return events.length > 0 ? events : null;
         }
 
-        // 向后兼容：处理字符串格式
         if (typeof openaiChunk === 'string') {
             return {
-                type: "content_block_delta",
+                type: 'content_block_delta',
                 index: 0,
                 delta: {
-                    type: "text_delta",
-                    text: openaiChunk
-                }
+                    type: 'text_delta',
+                    text: openaiChunk,
+                },
             };
         }
 
